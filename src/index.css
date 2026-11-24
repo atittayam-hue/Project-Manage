@@ -1,0 +1,40 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --font-sans: "Plus Jakarta Sans", "Noto Sans Thai", system-ui, -apple-system, sans-serif;
+    --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  html {
+    font-family: var(--font-sans);
+  }
+
+  .font-mono {
+    font-family: var(--font-mono);
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Custom subtle scrollbars for Kanban columns */
+.kanban-scroll::-webkit-scrollbar {
+  height: 6px;
+  width: 6px;
+}
+
+.kanban-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.kanban-scroll::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 9999px;
+}
+
+.kanban-scroll::-webkit-scrollbar-thumb:hover {
+  background: rgba(148, 163, 184, 0.55);
+}

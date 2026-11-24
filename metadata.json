@@ -1,0 +1,6 @@
+{
+  "name": "TaskPulse — Real-Time Kanban & Project Workspace",
+  "description": "ระบบจัดการโปรเจกต์และบอร์ดคัมบังแบบเรียลไทม์สไตล์ ClickUp พร้อมแดชบอร์ดสรุปผลงานและการเชื่อมต่อ GitHub เต็มรูปแบบ (ฟรี 100%)",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
