@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { X } from 'lucide-react';
 import { PRIORITY_META, STATUS_COLUMNS } from '../constants';
 import type { ProjectSpace, TaskPriority, TaskStatus, TeamMember } from '../types';
@@ -11,7 +11,7 @@ interface CreateTaskModalProps {
   defaultSpaceId: string;
   defaultAssigneeId: string;
   onClose: () => void;
-  onCreateMember: (input: { name: string; role: string }) => Promise<TeamMember>;
+  onCreateMember: (input: { name: string; email: string; role: string }) => Promise<TeamMember>;
   onCreate: (input: {
     spaceId: string;
     title: string;
@@ -48,6 +48,15 @@ export function CreateTaskModal({
   );
   const [tagsRaw, setTagsRaw] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (open) {
+      setSpaceId(defaultSpaceId || spaces[0]?.id || '');
+      setAssigneeIds(defaultAssigneeId ? [defaultAssigneeId] : []);
+      setSubmitError(null);
+    }
+  }, [open, defaultSpaceId, defaultAssigneeId, spaces]);
 
   if (!open) return null;
 
@@ -59,6 +68,7 @@ export function CreateTaskModal({
     e.preventDefault();
     if (!title.trim() || submitting) return;
     setSubmitting(true);
+    setSubmitError(null);
     try {
       const tags = tagsRaw
         .split(',')
@@ -79,6 +89,8 @@ export function CreateTaskModal({
       setDescription('');
       setTagsRaw('');
       onClose();
+    } catch (err) {
+      setSubmitError(err instanceof Error ? err.message : 'สร้างงานไม่สำเร็จ กรุณาลองใหม่อีกครั้ง');
     } finally {
       setSubmitting(false);
     }
@@ -111,6 +123,11 @@ export function CreateTaskModal({
         </div>
 
         <form onSubmit={handleSubmit} className="p-5 space-y-4">
+          {submitError && (
+            <div className="rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700 dark:border-rose-900/60 dark:bg-rose-950/40 dark:text-rose-300">
+              {submitError}
+            </div>
+          )}
           <div>
             <label
               htmlFor="new-task-title"

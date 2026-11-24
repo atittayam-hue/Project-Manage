@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type {
   ActiveClient,
+  AppNotification,
   ProjectSpace,
   TaskItem,
   TaskPriority,
@@ -12,13 +13,15 @@ import type {
 
 export type ConnectionState = 'connecting' | 'connected' | 'reconnecting';
 
-export function useWorkspaceSocket(activeMemberId: string) {
+export function useWorkspaceSocket(authToken: string | null, activeMemberId: string) {
   const [state, setState] = useState<WorkspaceState>({
     spaces: [],
     tasks: [],
     members: [],
     activities: [],
   });
+  const [notifications, setNotifications] = useState<AppNotification[]>([]);
+  const [latestToast, setLatestToast] = useState<AppNotification | null>(null);
   const [loading, setLoading] = useState(true);
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [activeClients, setActiveClients] = useState<ActiveClient[]>([]);
@@ -27,25 +30,24 @@ export function useWorkspaceSocket(activeMemberId: string) {
 
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
+  const toastTimerRef = useRef<number | null>(null);
   const reconnectAttemptsRef = useRef(0);
+  const authTokenRef = useRef(authToken);
   const activeMemberRef = useRef(activeMemberId);
 
   useEffect(() => {
+    authTokenRef.current = authToken;
+  }, [authToken]);
+
+  useEffect(() => {
     activeMemberRef.current = activeMemberId;
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(
-        JSON.stringify({
-          type: 'presence:identify',
-          memberId: activeMemberId,
-        })
-      );
-    }
   }, [activeMemberId]);
 
   const applyServerEvent = useCallback((event: WsServerEvent) => {
     switch (event.type) {
       case 'init': {
         setState(event.state);
+        setNotifications(Array.isArray(event.notifications) ? event.notifications : []);
         setActiveClients(event.activeClients);
         setClientId(event.clientId);
         setLoading(false);
@@ -105,6 +107,7 @@ export function useWorkspaceSocket(activeMemberId: string) {
               : prev.activities;
           return { ...prev, tasks: nextTasks, activities: nextActivities };
         });
+        setNotifications((prev) => prev.filter((n) => n.taskId !== event.taskId));
         break;
       }
       case 'task:comment_added': {
@@ -155,6 +158,13 @@ export function useWorkspaceSocket(activeMemberId: string) {
         });
         break;
       }
+      case 'member:updated': {
+        setState((prev) => ({
+          ...prev,
+          members: prev.members.map((m) => (m.id === event.member.id ? event.member : m)),
+        }));
+        break;
+      }
       case 'member:deleted': {
         setState((prev) => ({
           ...prev,
@@ -172,18 +182,70 @@ export function useWorkspaceSocket(activeMemberId: string) {
         }));
         break;
       }
+      case 'notification:created': {
+        setNotifications((prev) => {
+          if (prev.some((n) => n.id === event.notification.id)) return prev;
+          return [event.notification, ...prev].slice(0, 100);
+        });
+        setLatestToast(event.notification);
+        if (toastTimerRef.current) {
+          window.clearTimeout(toastTimerRef.current);
+        }
+        toastTimerRef.current = window.setTimeout(() => {
+          setLatestToast(null);
+        }, 7000);
+
+        if (
+          typeof window !== 'undefined' &&
+          'Notification' in window &&
+          Notification.permission === 'granted'
+        ) {
+          try {
+            new Notification(`${event.notification.actorName}: ${event.notification.message}`, {
+              body: event.notification.taskTitle,
+            });
+          } catch {
+            // Ignore browser notification errors in restricted frames
+          }
+        }
+        break;
+      }
+      case 'notification:updated': {
+        setNotifications((prev) =>
+          prev.map((n) =>
+            n.id === event.notificationId ? { ...n, read: event.read } : n
+          )
+        );
+        break;
+      }
+      case 'notifications:read_all': {
+        setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+        break;
+      }
       case 'workspace:reset': {
         setState(event.state);
+        setNotifications([]);
+        setLatestToast(null);
         break;
       }
     }
   }, []);
 
   useEffect(() => {
+    if (!authToken) {
+      setState({ spaces: [], tasks: [], members: [], activities: [] });
+      setNotifications([]);
+      setLatestToast(null);
+      setActiveClients([]);
+      setLoading(false);
+      return;
+    }
+
     let cancelled = false;
+    setLoading(true);
 
     const connect = () => {
-      if (cancelled) return;
+      if (cancelled || !authTokenRef.current) return;
       const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
       const wsUrl = `${protocol}//${window.location.host}/ws`;
       const ws = new WebSocket(wsUrl);
@@ -196,8 +258,8 @@ export function useWorkspaceSocket(activeMemberId: string) {
         setErrorBanner(null);
         ws.send(
           JSON.stringify({
-            type: 'presence:identify',
-            memberId: activeMemberRef.current,
+            type: 'auth',
+            token: authTokenRef.current,
           })
         );
       };
@@ -213,7 +275,7 @@ export function useWorkspaceSocket(activeMemberId: string) {
       };
 
       ws.onclose = () => {
-        if (cancelled) return;
+        if (cancelled || !authTokenRef.current) return;
         setConnectionState('reconnecting');
         const delay = Math.min(1000 * 2 ** reconnectAttemptsRef.current, 10_000);
         reconnectAttemptsRef.current += 1;
@@ -225,12 +287,14 @@ export function useWorkspaceSocket(activeMemberId: string) {
       };
     };
 
-    // Initial HTTP fetch fallback in case WS takes a moment
-    fetch('/api/workspace')
+    fetch('/api/workspace', {
+      headers: { Authorization: `Bearer ${authToken}` },
+    })
       .then((res) => (res.ok ? res.json() : null))
       .then((data) => {
         if (data && data.state && !cancelled) {
           setState(data.state);
+          setNotifications(Array.isArray(data.notifications) ? data.notifications : []);
           setActiveClients(data.activeClients || []);
           setLoading(false);
         }
@@ -246,12 +310,23 @@ export function useWorkspaceSocket(activeMemberId: string) {
       if (reconnectTimerRef.current) {
         window.clearTimeout(reconnectTimerRef.current);
       }
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+      }
       wsRef.current?.close();
     };
-  }, [applyServerEvent]);
+  }, [authToken, applyServerEvent]);
 
-  const currentActorName =
-    state.members.find((m) => m.id === activeMemberId)?.name || 'สมาชิกทีม';
+  const authHeaders = useCallback(
+    (extra?: Record<string, string>) => {
+      const headers: Record<string, string> = { ...(extra || {}) };
+      if (authToken) {
+        headers.Authorization = `Bearer ${authToken}`;
+      }
+      return headers;
+    },
+    [authToken]
+  );
 
   const createTask = useCallback(
     async (input: {
@@ -265,20 +340,36 @@ export function useWorkspaceSocket(activeMemberId: string) {
       dueDate?: string;
       tags?: string[];
     }) => {
-      const res = await fetch('/api/tasks', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...input, actorName: currentActorName }),
-      });
+      let res: Response;
+      try {
+        res = await fetch('/api/tasks', {
+          method: 'POST',
+          headers: authHeaders({ 'Content-Type': 'application/json' }),
+          body: JSON.stringify(input),
+        });
+      } catch {
+        const msg = 'ไม่สามารถเชื่อมต่อเซิร์ฟเวอร์ API ได้ (กรุณาตรวจสอบว่ารัน npm run dev / server.ts อยู่)';
+        setErrorBanner(msg);
+        throw new Error(msg);
+      }
       if (!res.ok) {
         const err = (await res.json().catch(() => ({}))) as { error?: string };
-        setErrorBanner(err.error || 'สร้างงานไม่สำเร็จ');
-        throw new Error(err.error || 'Failed to create task');
+        const msg =
+          err.error ||
+          (res.status === 404 || res.status === 405
+            ? 'ไม่พบ Backend API (/api/tasks) — แอปนี้ต้องรันผ่าน Node/Express server.ts ไม่ใช่ Static Hosting อย่างเดียว'
+            : 'สร้างงานไม่สำเร็จ');
+        setErrorBanner(msg);
+        throw new Error(msg);
       }
       const data = (await res.json()) as { task: TaskItem };
+      setState((prev) => {
+        if (prev.tasks.some((t) => t.id === data.task.id)) return prev;
+        return { ...prev, tasks: [...prev.tasks, data.task] };
+      });
       return data.task;
     },
-    [currentActorName]
+    [authHeaders]
   );
 
   const updateTask = useCallback(
@@ -291,8 +382,8 @@ export function useWorkspaceSocket(activeMemberId: string) {
 
       const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
         method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...patch, actorName: currentActorName }),
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(patch),
       });
 
       if (!res.ok) {
@@ -302,14 +393,13 @@ export function useWorkspaceSocket(activeMemberId: string) {
         throw new Error(err.error || 'Failed to update task');
       }
     },
-    [state.tasks, currentActorName]
+    [state.tasks, authHeaders]
   );
 
   const moveTask = useCallback(
     async (taskId: string, targetStatus: TaskStatus, targetIndex?: number) => {
       const snapshot = state.tasks;
 
-      // Optimistic local reorder
       setState((prev) => {
         const moving = prev.tasks.find((t) => t.id === taskId);
         if (!moving) return prev;
@@ -340,11 +430,10 @@ export function useWorkspaceSocket(activeMemberId: string) {
 
       const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/move`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           status: targetStatus,
           targetIndex,
-          actorName: currentActorName,
         }),
       });
 
@@ -353,7 +442,7 @@ export function useWorkspaceSocket(activeMemberId: string) {
         setErrorBanner('ย้ายสถานะงานไม่สำเร็จ');
       }
     },
-    [state.tasks, currentActorName]
+    [state.tasks, authHeaders]
   );
 
   const deleteTask = useCallback(
@@ -364,54 +453,57 @@ export function useWorkspaceSocket(activeMemberId: string) {
         tasks: prev.tasks.filter((t) => t.id !== taskId),
       }));
 
-      const res = await fetch(
-        `/api/tasks/${encodeURIComponent(taskId)}?actorName=${encodeURIComponent(currentActorName)}`,
-        { method: 'DELETE' }
-      );
+      const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}`, {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
       if (!res.ok) {
         setState((prev) => ({ ...prev, tasks: snapshot }));
         setErrorBanner('ลบงานไม่สำเร็จ');
       }
     },
-    [state.tasks, currentActorName]
+    [state.tasks, authHeaders]
   );
 
   const addComment = useCallback(
     async (taskId: string, text: string, mentions?: string[]) => {
       const res = await fetch(`/api/tasks/${encodeURIComponent(taskId)}/comments`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, authorId: activeMemberId, mentions }),
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ text, mentions }),
       });
       if (!res.ok) {
         setErrorBanner('ส่งความคิดเห็นไม่สำเร็จ');
         throw new Error('Failed to post comment');
       }
     },
-    [activeMemberId]
+    [authHeaders]
   );
 
-  const createMember = useCallback(async (input: { name: string; role: string }) => {
-    const res = await fetch('/api/members', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(input),
-    });
-    if (!res.ok) {
-      const err = (await res.json().catch(() => ({}))) as { error?: string };
-      setErrorBanner(err.error || 'เพิ่มสมาชิกไม่สำเร็จ');
-      throw new Error(err.error || 'Failed to create member');
-    }
-    const data = (await res.json()) as { member: TeamMember };
-    return data.member;
-  }, []);
+  const createMember = useCallback(
+    async (input: { name: string; email: string; role: string }) => {
+      const res = await fetch('/api/members', {
+        method: 'POST',
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(input),
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        setErrorBanner(err.error || 'เพิ่มสมาชิกไม่สำเร็จ');
+        throw new Error(err.error || 'Failed to create member');
+      }
+      const data = (await res.json()) as { member: TeamMember };
+      return data.member;
+    },
+    [authHeaders]
+  );
 
   const createSpace = useCallback(
     async (input: { name: string; key: string; description: string; color: string; githubRepo?: string }) => {
       const res = await fetch('/api/spaces', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ...input, actorName: currentActorName }),
+        headers: authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify(input),
       });
       if (!res.ok) {
         const err = (await res.json().catch(() => ({}))) as { error?: string };
@@ -421,40 +513,73 @@ export function useWorkspaceSocket(activeMemberId: string) {
       const data = (await res.json()) as { space: ProjectSpace };
       return data.space;
     },
-    [currentActorName]
+    [authHeaders]
   );
 
-  const deleteSpace = useCallback(async (spaceId: string) => {
-    const res = await fetch(`/api/spaces/${encodeURIComponent(spaceId)}`, {
-      method: 'DELETE',
-    });
-    if (!res.ok) {
-      const err = (await res.json().catch(() => ({}))) as { error?: string };
-      setErrorBanner(err.error || 'ลบโปรเจกต์ไม่สำเร็จ');
-    }
-  }, []);
+  const deleteSpace = useCallback(
+    async (spaceId: string) => {
+      const res = await fetch(`/api/spaces/${encodeURIComponent(spaceId)}`, {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        setErrorBanner(err.error || 'ลบโปรเจกต์ไม่สำเร็จ');
+      }
+    },
+    [authHeaders]
+  );
 
-  const deleteMember = useCallback(async (memberId: string) => {
-    const res = await fetch(`/api/members/${encodeURIComponent(memberId)}`, {
-      method: 'DELETE',
-    });
-    if (!res.ok) {
-      const err = (await res.json().catch(() => ({}))) as { error?: string };
-      setErrorBanner(err.error || 'ลบสมาชิกไม่สำเร็จ');
-    }
-  }, []);
+  const deleteMember = useCallback(
+    async (memberId: string) => {
+      const res = await fetch(`/api/members/${encodeURIComponent(memberId)}`, {
+        method: 'DELETE',
+        headers: authHeaders(),
+      });
+      if (!res.ok) {
+        const err = (await res.json().catch(() => ({}))) as { error?: string };
+        setErrorBanner(err.error || 'ลบสมาชิกไม่สำเร็จ');
+      }
+    },
+    [authHeaders]
+  );
+
+  const markNotificationRead = useCallback(
+    async (notificationId: string) => {
+      setNotifications((prev) =>
+        prev.map((n) => (n.id === notificationId ? { ...n, read: true } : n))
+      );
+      await fetch(`/api/notifications/${encodeURIComponent(notificationId)}/read`, {
+        method: 'PATCH',
+        headers: authHeaders(),
+      }).catch(() => undefined);
+    },
+    [authHeaders]
+  );
+
+  const markAllNotificationsRead = useCallback(async () => {
+    setNotifications((prev) => prev.map((n) => ({ ...n, read: true })));
+    await fetch('/api/notifications/read-all', {
+      method: 'POST',
+      headers: authHeaders(),
+    }).catch(() => undefined);
+  }, [authHeaders]);
 
   const resetWorkspace = useCallback(async () => {
     const res = await fetch('/api/workspace/reset', {
       method: 'POST',
+      headers: authHeaders(),
     });
     if (!res.ok) {
       setErrorBanner('ล้างข้อมูลไม่สำเร็จ');
     }
-  }, []);
+  }, [authHeaders]);
 
   return {
     state,
+    notifications,
+    latestToast,
+    dismissToast: () => setLatestToast(null),
     loading,
     connectionState,
     activeClients,
@@ -470,6 +595,8 @@ export function useWorkspaceSocket(activeMemberId: string) {
     deleteMember,
     createSpace,
     deleteSpace,
+    markNotificationRead,
+    markAllNotificationsRead,
     resetWorkspace,
   };
 }

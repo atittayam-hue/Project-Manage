@@ -27,6 +27,7 @@ interface TaskDetailModalProps {
   task: TaskItem | null;
   spaces: ProjectSpace[];
   members: TeamMember[];
+  authToken: string;
   githubSessionToken: string | null;
   githubUser: GitHubUser | null;
   onClose: () => void;
@@ -34,7 +35,7 @@ interface TaskDetailModalProps {
   onMoveTask: (taskId: string, status: TaskStatus) => Promise<void>;
   onDeleteTask: (taskId: string) => Promise<void>;
   onAddComment: (taskId: string, text: string, mentions?: string[]) => Promise<void>;
-  onCreateMember: (input: { name: string; role: string }) => Promise<TeamMember>;
+  onCreateMember: (input: { name: string; email: string; role: string }) => Promise<TeamMember>;
   onOpenGitHubSettings: () => void;
 }
 
@@ -42,6 +43,7 @@ export function TaskDetailModal({
   task,
   spaces,
   members,
+  authToken,
   githubSessionToken,
   githubUser,
   onClose,
@@ -156,7 +158,8 @@ export function TaskDetailModal({
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${githubSessionToken}`,
+          Authorization: `Bearer ${authToken}`,
+          'X-GitHub-Session': githubSessionToken,
         },
         body: JSON.stringify({ taskId: task.id, repo: pushRepo.trim() }),
       });
@@ -575,7 +578,15 @@ export function TaskDetailModal({
                           onClick={() => handleInsertMention(m)}
                           className="w-full flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-slate-700 hover:bg-indigo-50 hover:text-indigo-700 dark:text-slate-200 dark:hover:bg-indigo-950/60"
                         >
-                          <MemberAvatar member={m} size="xs" showName />
+                          <MemberAvatar member={m} size="xs" />
+                          <div className="min-w-0">
+                            <p className="font-medium truncate">{m.name}</p>
+                            {m.email && (
+                              <p className="text-[10px] font-mono text-slate-400 truncate">
+                                {m.email}
+                              </p>
+                            )}
+                          </div>
                         </button>
                       ))}
                     </div>

@@ -7,9 +7,11 @@ export type ViewMode = 'dashboard' | 'kanban' | 'list' | 'github';
 export interface TeamMember {
   id: string;
   name: string;
+  email: string;
   role: string;
   avatarUrl: string;
   initials: string;
+  status: 'active' | 'invited';
 }
 
 export interface ProjectSpace {
@@ -69,6 +71,21 @@ export interface ActivityLog {
   createdAt: string;
 }
 
+export interface AppNotification {
+  id: string;
+  recipientId: string;
+  actorId: string;
+  actorName: string;
+  type: 'task_assigned' | 'comment_mention';
+  taskId: string;
+  taskCode: string;
+  taskTitle: string;
+  spaceId: string;
+  message: string;
+  read: boolean;
+  createdAt: string;
+}
+
 export interface ActiveClient {
   clientId: string;
   memberId: string;
@@ -81,6 +98,7 @@ export interface WorkspaceState {
   tasks: TaskItem[];
   members: TeamMember[];
   activities: ActivityLog[];
+  notifications?: AppNotification[];
 }
 
 export interface GitHubUser {
@@ -145,6 +163,7 @@ export type WsServerEvent =
   | {
       type: 'init';
       state: WorkspaceState;
+      notifications: AppNotification[];
       activeClients: ActiveClient[];
       clientId: string;
     }
@@ -197,8 +216,24 @@ export type WsServerEvent =
       member: TeamMember;
     }
   | {
+      type: 'member:updated';
+      member: TeamMember;
+    }
+  | {
       type: 'member:deleted';
       memberId: string;
+    }
+  | {
+      type: 'notification:created';
+      notification: AppNotification;
+    }
+  | {
+      type: 'notification:updated';
+      notificationId: string;
+      read: boolean;
+    }
+  | {
+      type: 'notifications:read_all';
     }
   | {
       type: 'workspace:reset';

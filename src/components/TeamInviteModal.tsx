@@ -1,5 +1,5 @@
 import { useState } from 'react';
-import { Check, Copy, Link2, Trash2, UserPlus, Users, X } from 'lucide-react';
+import { Check, Copy, Link2, Mail, Trash2, UserPlus, Users, X } from 'lucide-react';
 import type { ActiveClient, TeamMember } from '../types';
 import { MemberAvatar } from './MemberAvatar';
 
@@ -9,9 +9,8 @@ interface TeamInviteModalProps {
   activeClients: ActiveClient[];
   activeMemberId: string;
   onClose: () => void;
-  onCreateMember: (input: { name: string; role: string }) => Promise<TeamMember>;
+  onCreateMember: (input: { name: string; email: string; role: string }) => Promise<TeamMember>;
   onDeleteMember: (memberId: string) => Promise<void>;
-  onSwitchMember: (memberId: string) => void;
 }
 
 export function TeamInviteModal({
@@ -22,11 +21,12 @@ export function TeamInviteModal({
   onClose,
   onCreateMember,
   onDeleteMember,
-  onSwitchMember,
 }: TeamInviteModalProps) {
   const [name, setName] = useState('');
+  const [email, setEmail] = useState('');
   const [role, setRole] = useState('');
   const [adding, setAdding] = useState(false);
+  const [formError, setFormError] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
   if (!open) return null;
@@ -41,15 +41,20 @@ export function TeamInviteModal({
 
   const handleAddMember = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!name.trim() || adding) return;
+    if (!name.trim() || !email.trim() || adding) return;
     setAdding(true);
+    setFormError(null);
     try {
       await onCreateMember({
         name: name.trim(),
+        email: email.trim(),
         role: role.trim() || 'Team Member',
       });
       setName('');
+      setEmail('');
       setRole('');
+    } catch (err) {
+      setFormError(err instanceof Error ? err.message : 'เพิ่มสมาชิกไม่สำเร็จ');
     } finally {
       setAdding(false);
     }
@@ -63,7 +68,7 @@ export function TeamInviteModal({
       <div
         role="dialog"
         aria-modal="true"
-        aria-label="จัดการทีมงานและเชิญเพื่อนเข้าร่วม"
+        aria-label="จัดการทีมงานและเชิญเพื่อนเข้าร่วมด้วยอีเมล"
         onClick={(e) => e.stopPropagation()}
         className="flex max-h-[90vh] w-full max-w-2xl flex-col overflow-hidden rounded-xl border border-slate-200 bg-white shadow-xl dark:border-slate-800 dark:bg-slate-900"
       >
@@ -72,7 +77,7 @@ export function TeamInviteModal({
           <div className="flex items-center gap-2.5">
             <Users className="h-4 w-4 text-indigo-600 dark:text-indigo-400" />
             <h2 className="text-base font-semibold text-slate-900 dark:text-white">
-              ทีมงานและการเชิญเพื่อนเข้าร่วม ({members.length} คน)
+              ทีมงานและการเชิญเข้าร่วมด้วยอีเมล ({members.length} คน)
             </h2>
           </div>
           <button
@@ -90,10 +95,10 @@ export function TeamInviteModal({
           <section className="rounded-lg border border-slate-200 bg-slate-50/70 p-4 space-y-3 dark:border-slate-800 dark:bg-slate-800/40">
             <div>
               <h3 className="text-xs font-semibold text-slate-900 dark:text-white">
-                วิธีที่ 1: ส่งลิงก์เชิญให้เพื่อนร่วมทีมกดเข้าร่วมเอง
+                วิธีที่ 1: ส่งลิงก์ให้เพื่อนร่วมทีมลงทะเบียนด้วยอีเมล
               </h3>
               <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                เมื่อเพื่อนเปิดลิงก์นี้ จะมีหน้าต่างให้กรอกชื่อและตำแหน่งเพื่อเข้าใช้งานบอร์ดเดียวกันแบบเรียลไทม์ทันที
+                เพื่อนที่เปิดลิงก์นี้สามารถกรอกอีเมลและตั้งรหัสผ่านเพื่อเข้าใช้งานบอร์ดเดียวกันแบบเรียลไทม์ทันที
               </p>
             </div>
 
@@ -122,35 +127,48 @@ export function TeamInviteModal({
             </div>
           </section>
 
-          {/* 2. Add Member Directly */}
+          {/* 2. Add Member by Email */}
           <section className="space-y-3">
             <div>
               <h3 className="text-xs font-semibold text-slate-900 dark:text-white">
-                วิธีที่ 2: เพิ่มรายชื่อสมาชิกไว้ล่วงหน้า (เพื่อให้แท็กบนการ์ดงานได้ทันที)
+                วิธีที่ 2: เพิ่มอีเมลสมาชิกไว้ล่วงหน้า (แท็กงานได้ทันที)
               </h3>
               <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400">
-                เพิ่มชื่อเพื่อนร่วมทีมไว้ในระบบ แล้วส่งลิงก์เฉพาะตัวของแต่ละคนให้กดเข้าใช้งานได้ทันที
+                เพิ่มชื่อและอีเมลของเพื่อนร่วมทีมเพื่อแท็กเป็นผู้รับผิดชอบบนการ์ดงาน เมื่อเพื่อนเข้าสู่ระบบด้วยอีเมลนี้ จะเห็นงานและแจ้งเตือนทันที
               </p>
             </div>
+
+            {formError && (
+              <p className="text-xs text-rose-600 dark:text-rose-400">{formError}</p>
+            )}
 
             <form onSubmit={handleAddMember} className="grid grid-cols-1 sm:grid-cols-12 gap-2">
               <input
                 type="text"
+                required
                 value={name}
                 onChange={(e) => setName(e.target.value)}
-                placeholder="ชื่อสมาชิก (เช่น เมย์ (May))"
-                className="sm:col-span-5 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                placeholder="ชื่อสมาชิก (เช่น เมย์)"
+                className="sm:col-span-3 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+              />
+              <input
+                type="email"
+                required
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="อีเมล (may@company.com)"
+                className="sm:col-span-4 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
               />
               <input
                 type="text"
                 value={role}
                 onChange={(e) => setRole(e.target.value)}
-                placeholder="ตำแหน่ง (เช่น QA, Backend)"
-                className="sm:col-span-4 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
+                placeholder="ตำแหน่ง (เช่น QA)"
+                className="sm:col-span-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100"
               />
               <button
                 type="submit"
-                disabled={!name.trim() || adding}
+                disabled={!name.trim() || !email.trim() || adding}
                 className="sm:col-span-3 inline-flex items-center justify-center gap-1.5 rounded-lg bg-slate-900 px-3 py-2 text-xs font-semibold text-white hover:bg-slate-800 disabled:opacity-50 dark:bg-indigo-600 dark:hover:bg-indigo-700 whitespace-nowrap"
               >
                 <UserPlus className="h-3.5 w-3.5" />
@@ -168,7 +186,9 @@ export function TeamInviteModal({
               {members.map((member) => {
                 const isOnline = activeClients.some((c) => c.memberId === member.id);
                 const isCurrent = member.id === activeMemberId;
-                const personalUrl = `${window.location.origin}/?member=${encodeURIComponent(member.id)}`;
+                const personalUrl = member.email
+                  ? `${window.location.origin}/?join=1&email=${encodeURIComponent(member.email)}`
+                  : baseInviteUrl;
 
                 return (
                   <div
@@ -189,43 +209,49 @@ export function TeamInviteModal({
                             </span>
                           )}
                         </div>
-                        <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate">
-                          {member.role}
-                          {isCurrent ? ' · บัญชีที่คุณใช้งานอยู่' : ''}
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400 truncate flex items-center gap-1.5">
+                          {member.email ? (
+                            <>
+                              <Mail className="h-3 w-3 shrink-0 text-slate-400" />
+                              <span className="font-mono">{member.email}</span>
+                              <span aria-hidden="true">·</span>
+                            </>
+                          ) : null}
+                          <span>{member.role}</span>
+                          <span aria-hidden="true">·</span>
+                          <span>
+                            {isCurrent
+                              ? 'บัญชีของคุณ'
+                              : member.status === 'active'
+                                ? 'ลงทะเบียนแล้ว'
+                                : 'รอตั้งรหัสผ่านครั้งแรก'}
+                          </span>
                         </p>
                       </div>
                     </div>
 
                     <div className="flex items-center gap-2 shrink-0">
-                      <button
-                        type="button"
-                        onClick={() => copyLink(personalUrl, member.id)}
-                        className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
-                      >
-                        {copiedId === member.id ? (
-                          <>
-                            <Check className="h-3 w-3 text-emerald-600" />
-                            <span>คัดลอกแล้ว</span>
-                          </>
-                        ) : (
-                          <>
-                            <Link2 className="h-3 w-3" />
-                            <span>ลิงก์เข้าใช้งาน</span>
-                          </>
-                        )}
-                      </button>
-
-                      {!isCurrent && (
+                      {!isCurrent && member.status !== 'active' && (
                         <button
                           type="button"
-                          onClick={() => onSwitchMember(member.id)}
-                          className="rounded-md border border-slate-200 bg-slate-50 px-2.5 py-1.5 text-[11px] font-medium text-slate-700 hover:bg-slate-100 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+                          onClick={() => copyLink(personalUrl, member.id)}
+                          className="inline-flex items-center gap-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] font-medium text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
                         >
-                          ใช้งานเป็นคนนี้
+                          {copiedId === member.id ? (
+                            <>
+                              <Check className="h-3 w-3 text-emerald-600" />
+                              <span>คัดลอกลิงก์แล้ว</span>
+                            </>
+                          ) : (
+                            <>
+                              <Link2 className="h-3 w-3" />
+                              <span>คัดลอกลิงก์ตั้งรหัสผ่าน</span>
+                            </>
+                          )}
                         </button>
                       )}
 
-                      {members.length > 1 && (
+                      {!isCurrent && members.length > 1 && (
                         <button
                           type="button"
                           onClick={() => void onDeleteMember(member.id)}

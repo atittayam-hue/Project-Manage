@@ -19,7 +19,7 @@ interface KanbanBoardProps {
   activeSpaceId: string | 'all';
   onMoveTask: (taskId: string, targetStatus: TaskStatus, targetIndex?: number) => Promise<void>;
   onUpdateTask: (taskId: string, patch: Partial<TaskItem>) => Promise<void>;
-  onCreateMember: (input: { name: string; role: string }) => Promise<TeamMember>;
+  onCreateMember: (input: { name: string; email: string; role: string }) => Promise<TeamMember>;
   onSelectTask: (task: TaskItem) => void;
   onQuickCreateTask: (status: TaskStatus, title: string) => Promise<void>;
 }
@@ -49,6 +49,8 @@ export function KanbanBoard({
       await onQuickCreateTask(status, trimmed);
       setQuickTitle('');
       setQuickAddCol(null);
+    } catch {
+      // Error banner is handled by useWorkspaceSocket
     } finally {
       setSubmittingQuick(false);
     }

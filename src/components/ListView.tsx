@@ -11,7 +11,7 @@ interface ListViewProps {
   onSelectTask: (task: TaskItem) => void;
   onUpdateTask: (taskId: string, patch: Partial<TaskItem>) => Promise<void>;
   onMoveTask: (taskId: string, targetStatus: TaskStatus) => Promise<void>;
-  onCreateMember: (input: { name: string; role: string }) => Promise<TeamMember>;
+  onCreateMember: (input: { name: string; email: string; role: string }) => Promise<TeamMember>;
 }
 
 export function ListView({

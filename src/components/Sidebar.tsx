@@ -7,6 +7,7 @@ import {
   Kanban,
   Layers,
   ListTodo,
+  LogOut,
   Moon,
   RotateCcw,
   Sun,
@@ -23,8 +24,8 @@ interface SidebarProps {
   tasks: TaskItem[];
   members: TeamMember[];
   activeClients: ActiveClient[];
-  activeMemberId: string;
-  onChangeActiveMember: (memberId: string) => void;
+  currentUser: TeamMember;
+  onLogout: () => void;
   activeSpaceId: string | 'all';
   onSelectSpace: (spaceId: string | 'all') => void;
   viewMode: ViewMode;
@@ -46,8 +47,8 @@ export function Sidebar({
   tasks,
   members,
   activeClients,
-  activeMemberId,
-  onChangeActiveMember,
+  currentUser,
+  onLogout,
   activeSpaceId,
   onSelectSpace,
   viewMode,
@@ -310,7 +311,7 @@ export function Sidebar({
         </div>
       </div>
 
-      {/* Bottom Real-Time Presence & Active User Selector */}
+      {/* Bottom Real-Time Presence & Logged-in Profile */}
       <div className="border-t border-slate-200 dark:border-slate-800 p-3 space-y-3">
         <div className="flex items-center justify-between text-xs">
           <span className="inline-flex items-center gap-2 text-slate-600 dark:text-slate-400 font-medium">
@@ -328,32 +329,46 @@ export function Sidebar({
           </span>
         </div>
 
-        <div className="flex items-center justify-between gap-2">
-          <div className="flex -space-x-1.5 overflow-hidden">
-            {Array.from(uniqueOnlineMembers.values()).map((client) => {
-              const member = members.find((m) => m.id === client.memberId);
-              return (
-                <div key={client.clientId} title={`${client.name} (ออนไลน์)`}>
-                  <MemberAvatar member={member} size="xs" />
-                </div>
-              );
-            })}
+        {uniqueOnlineMembers.size > 0 && (
+          <div className="flex items-center gap-2">
+            <div className="flex -space-x-1.5 overflow-hidden">
+              {Array.from(uniqueOnlineMembers.values()).map((client) => {
+                const member = members.find((m) => m.id === client.memberId);
+                return (
+                  <div key={client.clientId} title={`${client.name} (ออนไลน์)`}>
+                    <MemberAvatar member={member} size="xs" />
+                  </div>
+                );
+              })}
+            </div>
+            <span className="text-[11px] text-slate-400 dark:text-slate-500 truncate">
+              กำลังใช้งานร่วมกัน
+            </span>
           </div>
-          <label className="sr-only" htmlFor="active-member-select">
-            ผู้ใช้งานปัจจุบัน
-          </label>
-          <select
-            id="active-member-select"
-            value={activeMemberId}
-            onChange={(e) => onChangeActiveMember(e.target.value)}
-            className="flex-1 min-w-0 rounded-lg border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs font-medium text-slate-700 focus:border-indigo-500 focus:outline-none dark:border-slate-700 dark:bg-slate-800 dark:text-slate-200"
+        )}
+
+        <div className="flex items-center justify-between gap-2 rounded-lg border border-slate-200 bg-slate-50/70 px-2.5 py-2 dark:border-slate-800 dark:bg-slate-800/50">
+          <div className="flex items-center gap-2 min-w-0">
+            <MemberAvatar member={currentUser} size="sm" />
+            <div className="min-w-0">
+              <p className="text-xs font-semibold text-slate-900 dark:text-white truncate">
+                {currentUser.name}
+              </p>
+              <p className="text-[10px] font-mono text-slate-500 dark:text-slate-400 truncate">
+                {currentUser.email || currentUser.role}
+              </p>
+            </div>
+          </div>
+
+          <button
+            type="button"
+            onClick={onLogout}
+            title="ออกจากระบบ"
+            aria-label="ออกจากระบบ"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-white hover:text-rose-600 dark:text-slate-400 dark:hover:bg-slate-700 dark:hover:text-rose-400 transition-colors"
           >
-            {members.map((m) => (
-              <option key={m.id} value={m.id}>
-                {m.name}
-              </option>
-            ))}
-          </select>
+            <LogOut className="h-3.5 w-3.5" />
+          </button>
         </div>
       </div>
     </aside>

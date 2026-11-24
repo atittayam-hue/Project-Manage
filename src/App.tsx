@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from 'react';
-import { AlertCircle, X } from 'lucide-react';
+import { AlertCircle, BellRing, X } from 'lucide-react';
+import { AuthScreen } from './components/AuthScreen';
 import { CreateSpaceModal } from './components/CreateSpaceModal';
 import { CreateTaskModal } from './components/CreateTaskModal';
 import { DashboardView } from './components/DashboardView';
 import { GitHubIntegrationView } from './components/GitHubIntegrationView';
-import { JoinWorkspaceModal } from './components/JoinWorkspaceModal';
 import { KanbanBoard } from './components/KanbanBoard';
 import { ListView } from './components/ListView';
 import { Sidebar } from './components/Sidebar';
@@ -13,11 +13,33 @@ import { TeamInviteModal } from './components/TeamInviteModal';
 import { TopBar } from './components/TopBar';
 import { getTaskAssigneeIds } from './constants';
 import { useWorkspaceSocket } from './hooks/useWorkspaceSocket';
-import type { GitHubUser, TaskItem, TaskPriority, TaskStatus, ViewMode } from './types';
+import type {
+  AppNotification,
+  GitHubUser,
+  TaskItem,
+  TaskPriority,
+  TaskStatus,
+  TeamMember,
+  ViewMode,
+} from './types';
 import { downloadTextFile, exportWorkspaceJson, generateGitHubMarkdown } from './utils/exportWorkspace';
 
 export default function App() {
-  const [activeMemberId, setActiveMemberId] = useState('m-owner');
+  const [authToken, setAuthToken] = useState<string | null>(null);
+  const [currentUser, setCurrentUser] = useState<TeamMember | null>(null);
+  const [authChecking, setAuthChecking] = useState(true);
+  const [ownerNeedsClaim, setOwnerNeedsClaim] = useState(false);
+
+  const [inviteParams] = useState(() => {
+    const params = new URLSearchParams(window.location.search);
+    const email = params.get('email') || '';
+    const join = params.get('join') === '1';
+    return {
+      email,
+      mode: (join || email ? 'register' : 'login') as 'login' | 'register',
+    };
+  });
+
   const [activeSpaceId, setActiveSpaceId] = useState<string | 'all'>('all');
   const [viewMode, setViewMode] = useState<ViewMode>('kanban');
   const [searchQuery, setSearchQuery] = useState('');
@@ -30,14 +52,41 @@ export default function App() {
   const [createTaskOpen, setCreateTaskOpen] = useState(false);
   const [createSpaceOpen, setCreateSpaceOpen] = useState(false);
   const [teamInviteOpen, setTeamInviteOpen] = useState(false);
-  const [joinModalOpen, setJoinModalOpen] = useState(false);
 
   // GitHub session held strictly in React memory (never persisted in localStorage)
   const [githubSessionToken, setGithubSessionToken] = useState<string | null>(null);
   const [githubUser, setGithubUser] = useState<GitHubUser | null>(null);
 
+  const refreshAuthStatus = async () => {
+    try {
+      const res = await fetch('/api/auth/status');
+      if (res.ok) {
+        const data = (await res.json()) as { ownerNeedsClaim?: boolean };
+        setOwnerNeedsClaim(Boolean(data.ownerNeedsClaim));
+      }
+    } finally {
+      setAuthChecking(false);
+    }
+  };
+
+  useEffect(() => {
+    void refreshAuthStatus();
+  }, []);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (darkMode) {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+  }, [darkMode]);
+
   const {
     state,
+    notifications,
+    latestToast,
+    dismissToast,
     loading,
     connectionState,
     activeClients,
@@ -51,43 +100,24 @@ export default function App() {
     createMember,
     deleteMember,
     createSpace,
+    markNotificationRead,
+    markAllNotificationsRead,
     resetWorkspace,
-  } = useWorkspaceSocket(activeMemberId);
+  } = useWorkspaceSocket(authToken, currentUser?.id || '');
 
-  // Keep activeMemberId & activeSpaceId valid if workspace resets or members change
+  // Keep activeSpaceId valid if workspace resets
   useEffect(() => {
-    if (loading) return;
-    if (state.members.length > 0 && !state.members.some((m) => m.id === activeMemberId)) {
-      setActiveMemberId(state.members[0].id);
-    }
+    if (loading || !authToken) return;
     if (activeSpaceId !== 'all' && !state.spaces.some((s) => s.id === activeSpaceId)) {
       setActiveSpaceId('all');
     }
-  }, [loading, state.members, state.spaces, activeMemberId, activeSpaceId]);
+  }, [loading, authToken, state.spaces, activeSpaceId]);
 
-  // Handle invite link query params (?join=1 or ?member=<id>)
-  useEffect(() => {
-    if (loading) return;
-    const params = new URLSearchParams(window.location.search);
-    const joinParam = params.get('join');
-    const memberParam = params.get('member');
-
-    if (memberParam && state.members.some((m) => m.id === memberParam)) {
-      setActiveMemberId(memberParam);
-      window.history.replaceState({}, '', window.location.pathname);
-    } else if (joinParam === '1') {
-      setJoinModalOpen(true);
-    }
-  }, [loading, state.members]);
-
-  useEffect(() => {
-    const root = document.documentElement;
-    if (darkMode) {
-      root.classList.add('dark');
-    } else {
-      root.classList.remove('dark');
-    }
-  }, [darkMode]);
+  // Sync currentUser profile if updated in workspace members list
+  const resolvedCurrentUser = useMemo(() => {
+    if (!currentUser) return null;
+    return state.members.find((m) => m.id === currentUser.id) || currentUser;
+  }, [currentUser, state.members]);
 
   const activeSpace = useMemo(
     () => (activeSpaceId === 'all' ? undefined : state.spaces.find((s) => s.id === activeSpaceId)),
@@ -120,20 +150,65 @@ export default function App() {
     [selectedTaskId, state.tasks]
   );
 
-  const activeActorName =
-    state.members.find((m) => m.id === activeMemberId)?.name || 'สมาชิกทีม';
+  const handleLogout = async () => {
+    if (authToken) {
+      await fetch('/api/auth/logout', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${authToken}` },
+      }).catch(() => undefined);
+    }
+    setAuthToken(null);
+    setCurrentUser(null);
+    setSelectedTaskId(null);
+    setActiveSpaceId('all');
+    void refreshAuthStatus();
+  };
 
   const handleQuickCreateTask = async (status: TaskStatus, title: string) => {
     const targetSpaceId =
-      activeSpaceId !== 'all' ? activeSpaceId : state.spaces[0]?.id || 'space-web';
+      activeSpaceId !== 'all' ? activeSpaceId : state.spaces[0]?.id || 'space-main';
     await createTask({
       spaceId: targetSpaceId,
       title,
       status,
       priority: 'normal',
-      assigneeId: activeMemberId,
+      assigneeId: resolvedCurrentUser?.id || '',
     });
   };
+
+  const handleSelectNotification = (notification: AppNotification) => {
+    if (!notification.read) {
+      void markNotificationRead(notification.id);
+    }
+    if (state.tasks.some((t) => t.id === notification.taskId)) {
+      setSelectedTaskId(notification.taskId);
+    }
+  };
+
+  if (authChecking) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-slate-50 text-slate-500 dark:bg-slate-950 dark:text-slate-400 text-sm">
+        กำลังตรวจสอบสถานะพื้นที่ทำงาน...
+      </div>
+    );
+  }
+
+  if (!authToken || !resolvedCurrentUser) {
+    return (
+      <AuthScreen
+        ownerNeedsClaim={ownerNeedsClaim}
+        initialEmail={inviteParams.email}
+        initialMode={inviteParams.mode}
+        darkMode={darkMode}
+        onToggleDarkMode={() => setDarkMode((prev) => !prev)}
+        onAuthenticated={(token, member) => {
+          setOwnerNeedsClaim(false);
+          setAuthToken(token);
+          setCurrentUser(member);
+        }}
+      />
+    );
+  }
 
   return (
     <div className="flex h-screen w-screen overflow-hidden bg-slate-50 text-slate-900 dark:bg-slate-950 dark:text-slate-100">
@@ -142,8 +217,8 @@ export default function App() {
         tasks={state.tasks}
         members={state.members}
         activeClients={activeClients}
-        activeMemberId={activeMemberId}
-        onChangeActiveMember={setActiveMemberId}
+        currentUser={resolvedCurrentUser}
+        onLogout={() => void handleLogout()}
         activeSpaceId={activeSpaceId}
         onSelectSpace={setActiveSpaceId}
         viewMode={viewMode}
@@ -171,6 +246,7 @@ export default function App() {
         <TopBar
           activeSpace={activeSpace}
           members={state.members}
+          notifications={notifications}
           viewMode={viewMode}
           onSelectView={setViewMode}
           searchQuery={searchQuery}
@@ -179,6 +255,8 @@ export default function App() {
           onChangePriorityFilter={setPriorityFilter}
           assigneeFilter={assigneeFilter}
           onChangeAssigneeFilter={setAssigneeFilter}
+          onSelectNotification={handleSelectNotification}
+          onMarkAllNotificationsRead={() => void markAllNotificationsRead()}
           onOpenCreateTask={() => setCreateTaskOpen(true)}
           onOpenMobileMenu={() => setMobileMenuOpen(true)}
         />
@@ -273,7 +351,8 @@ export default function App() {
               spaces={state.spaces}
               tasks={state.tasks}
               activeSpaceId={activeSpaceId}
-              activeActorName={activeActorName}
+              activeActorName={resolvedCurrentUser.name}
+              authToken={authToken}
               githubSessionToken={githubSessionToken}
               githubUser={githubUser}
               onGitHubConnected={(token, user) => {
@@ -290,11 +369,61 @@ export default function App() {
         </main>
       </div>
 
+      {/* Real-Time Tag Notification Toast */}
+      {latestToast && (
+        <div
+          role="status"
+          className="fixed bottom-4 right-4 z-50 w-80 max-w-[calc(100vw-2rem)] rounded-xl border border-indigo-200 bg-white p-4 shadow-xl dark:border-indigo-900 dark:bg-slate-900"
+        >
+          <div className="flex items-start gap-3">
+            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-indigo-100 text-indigo-700 dark:bg-indigo-950/60 dark:text-indigo-300">
+              <BellRing className="h-4 w-4" />
+            </span>
+            <div className="flex-1 min-w-0">
+              <p className="text-xs font-semibold text-slate-900 dark:text-white truncate">
+                {latestToast.actorName} · {latestToast.message}
+              </p>
+              <p className="mt-0.5 text-xs text-slate-500 dark:text-slate-400 truncate">
+                {latestToast.taskCode} · {latestToast.taskTitle}
+              </p>
+              <div className="mt-2.5 flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    handleSelectNotification(latestToast);
+                    dismissToast();
+                  }}
+                  className="text-xs font-semibold text-indigo-600 hover:underline dark:text-indigo-400"
+                >
+                  เปิดดูงาน
+                </button>
+                <button
+                  type="button"
+                  onClick={dismissToast}
+                  className="text-xs text-slate-400 hover:text-slate-600 dark:hover:text-slate-200"
+                >
+                  ปิด
+                </button>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={dismissToast}
+              aria-label="ปิดการแจ้งเตือน"
+              className="text-slate-400 hover:text-slate-700 dark:hover:text-slate-200"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Modals */}
       <TaskDetailModal
         task={selectedTask}
         spaces={state.spaces}
         members={state.members}
+        authToken={authToken}
         githubSessionToken={githubSessionToken}
         githubUser={githubUser}
         onClose={() => setSelectedTaskId(null)}
@@ -311,7 +440,7 @@ export default function App() {
         spaces={state.spaces}
         members={state.members}
         defaultSpaceId={activeSpaceId !== 'all' ? activeSpaceId : state.spaces[0]?.id || ''}
-        defaultAssigneeId={activeMemberId}
+        defaultAssigneeId={resolvedCurrentUser.id}
         onClose={() => setCreateTaskOpen(false)}
         onCreateMember={createMember}
         onCreate={createTask}
@@ -330,38 +459,10 @@ export default function App() {
         open={teamInviteOpen}
         members={state.members}
         activeClients={activeClients}
-        activeMemberId={activeMemberId}
+        activeMemberId={resolvedCurrentUser.id}
         onClose={() => setTeamInviteOpen(false)}
         onCreateMember={createMember}
-        onDeleteMember={async (memberId) => {
-          await deleteMember(memberId);
-          if (activeMemberId === memberId) {
-            const fallback = state.members.find((m) => m.id !== memberId);
-            if (fallback) setActiveMemberId(fallback.id);
-          }
-        }}
-        onSwitchMember={(memberId) => {
-          setActiveMemberId(memberId);
-          setTeamInviteOpen(false);
-        }}
-      />
-
-      <JoinWorkspaceModal
-        open={joinModalOpen}
-        members={state.members}
-        onJoinAsNewMember={async (input) => {
-          const created = await createMember(input);
-          setActiveMemberId(created.id);
-          window.history.replaceState({}, '', window.location.pathname);
-        }}
-        onJoinAsExisting={(memberId) => {
-          setActiveMemberId(memberId);
-          window.history.replaceState({}, '', window.location.pathname);
-        }}
-        onClose={() => {
-          setJoinModalOpen(false);
-          window.history.replaceState({}, '', window.location.pathname);
-        }}
+        onDeleteMember={deleteMember}
       />
     </div>
   );

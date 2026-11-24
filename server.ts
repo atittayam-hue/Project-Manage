@@ -9,6 +9,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import type {
   ActiveClient,
   ActivityLog,
+  AppNotification,
   GitHubIssue,
   GitHubPullRequest,
   GitHubRepoInfo,
@@ -19,6 +20,7 @@ import type {
   TaskItem,
   TaskPriority,
   TaskStatus,
+  TeamMember,
   WorkspaceState,
   WsServerEvent,
 } from './src/types.ts';
@@ -32,6 +34,20 @@ const DATA_FILE = path.resolve(DATA_DIR, 'workspace.json');
 const VALID_STATUSES: ReadonlyArray<TaskStatus> = ['todo', 'in_progress', 'review', 'done'];
 const VALID_PRIORITIES: ReadonlyArray<TaskPriority> = ['urgent', 'high', 'normal', 'low'];
 const REPO_PATTERN = /^[a-zA-Z0-9_.-]{1,100}\/[a-zA-Z0-9_.-]{1,100}$/;
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
+const AUTH_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+interface StoredMember extends TeamMember {
+  passwordHash?: string;
+}
+
+interface StoredWorkspaceState {
+  spaces: ProjectSpace[];
+  tasks: TaskItem[];
+  members: StoredMember[];
+  activities: ActivityLog[];
+  notifications: AppNotification[];
+}
 
 function isValidRepoSlug(repo: string): boolean {
   if (!REPO_PATTERN.test(repo)) return false;
@@ -49,16 +65,77 @@ function isSafeHttpUrl(url: string | undefined): boolean {
   }
 }
 
-function createInitialState(): WorkspaceState {
+function normalizeEmail(raw: string): string {
+  return raw.trim().toLowerCase().slice(0, 160);
+}
+
+function isValidEmail(email: string): boolean {
+  return Boolean(email && email.length <= 160 && EMAIL_PATTERN.test(email));
+}
+
+function computeInitials(name: string): string {
+  const words = name.trim().split(/\s+/).filter(Boolean);
+  if (words.length >= 2) {
+    return `${words[0][0]}${words[1][0]}`.toUpperCase();
+  }
+  return name.trim().slice(0, 2).toUpperCase() || 'US';
+}
+
+function hashPassword(password: string): string {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derived = crypto.scryptSync(password, salt, 64).toString('hex');
+  return `${salt}:${derived}`;
+}
+
+function verifyPassword(password: string, storedHash: string): boolean {
+  const parts = storedHash.split(':');
+  if (parts.length !== 2) return false;
+  const [salt, expectedHex] = parts;
+  if (!salt || !expectedHex) return false;
+  try {
+    const actual = crypto.scryptSync(password, salt, 64);
+    const expected = Buffer.from(expectedHex, 'hex');
+    if (actual.length !== expected.length) return false;
+    return crypto.timingSafeEqual(actual, expected);
+  } catch {
+    return false;
+  }
+}
+
+function sanitizeMember(member: StoredMember): TeamMember {
+  return {
+    id: member.id,
+    name: member.name,
+    email: member.email || '',
+    role: member.role,
+    avatarUrl: member.avatarUrl || '',
+    initials: member.initials,
+    status: member.passwordHash ? 'active' : 'invited',
+  };
+}
+
+function buildUserWorkspaceState(state: StoredWorkspaceState, memberId: string): WorkspaceState {
+  return {
+    spaces: state.spaces,
+    tasks: state.tasks,
+    members: state.members.map(sanitizeMember),
+    activities: state.activities,
+    notifications: state.notifications.filter((n) => n.recipientId === memberId),
+  };
+}
+
+function createInitialState(): StoredWorkspaceState {
   const now = new Date().toISOString();
 
-  const members = [
+  const members: StoredMember[] = [
     {
       id: 'm-owner',
       name: 'ผู้ดูแลพื้นที่ (Owner)',
+      email: '',
       role: 'Project Owner',
       avatarUrl: '',
       initials: 'OW',
+      status: 'invited',
     },
   ];
 
@@ -73,17 +150,14 @@ function createInitialState(): WorkspaceState {
     },
   ];
 
-  const tasks: TaskItem[] = [];
-  const activities: ActivityLog[] = [];
-
-  return { spaces, tasks, members, activities };
+  return { spaces, tasks: [], members, activities: [], notifications: [] };
 }
 
-function loadWorkspaceState(): WorkspaceState {
+function loadWorkspaceState(): StoredWorkspaceState {
   try {
     if (fs.existsSync(DATA_FILE)) {
       const raw = fs.readFileSync(DATA_FILE, 'utf-8');
-      const parsed = JSON.parse(raw) as WorkspaceState;
+      const parsed = JSON.parse(raw) as Partial<StoredWorkspaceState>;
       if (
         parsed &&
         Array.isArray(parsed.spaces) &&
@@ -101,8 +175,13 @@ function loadWorkspaceState(): WorkspaceState {
                   ? [t.assigneeId]
                   : [],
           })),
-          members: parsed.members,
+          members: parsed.members.map((m) => ({
+            ...m,
+            email: typeof m.email === 'string' ? normalizeEmail(m.email) : '',
+            status: m.passwordHash ? 'active' : 'invited',
+          })),
           activities: Array.isArray(parsed.activities) ? parsed.activities : [],
+          notifications: Array.isArray(parsed.notifications) ? parsed.notifications : [],
         };
       }
     }
@@ -114,7 +193,7 @@ function loadWorkspaceState(): WorkspaceState {
   return initial;
 }
 
-function persistWorkspaceState(state: WorkspaceState) {
+function persistWorkspaceState(state: StoredWorkspaceState) {
   try {
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -143,8 +222,10 @@ async function startServer() {
   const app = express();
   app.use(express.json({ limit: '1mb' }));
 
-  const state: WorkspaceState = loadWorkspaceState();
+  const state: StoredWorkspaceState = loadWorkspaceState();
 
+  // In-memory workspace auth sessions (never persisted to disk)
+  const authSessions = new Map<string, { memberId: string; expiresAt: number }>();
   // In-memory GitHub OAuth & PAT session store (never persisted to disk)
   const githubSessions = new Map<string, { accessToken: string; user: GitHubUser }>();
   // In-memory OAuth CSRF state tokens (expire in 10 minutes)
@@ -167,6 +248,56 @@ async function startServer() {
     }
   }
 
+  function sendToMember(memberId: string, event: WsServerEvent) {
+    const payload = JSON.stringify(event);
+    for (const [socket, client] of clients) {
+      if (client.memberId === memberId && socket.readyState === WebSocket.OPEN) {
+        socket.send(payload);
+      }
+    }
+  }
+
+  function createAuthSession(memberId: string): string {
+    const token = crypto.randomBytes(32).toString('hex');
+    authSessions.set(token, {
+      memberId,
+      expiresAt: Date.now() + AUTH_SESSION_TTL_MS,
+    });
+    return token;
+  }
+
+  function getWorkspaceAuthMember(req: express.Request): StoredMember | null {
+    const auth = req.headers.authorization;
+    const rawHeader =
+      auth && auth.startsWith('Bearer ')
+        ? auth.slice(7).trim()
+        : typeof req.headers['x-workspace-token'] === 'string'
+          ? req.headers['x-workspace-token'].trim()
+          : '';
+    if (!rawHeader) return null;
+    const session = authSessions.get(rawHeader);
+    if (!session) return null;
+    if (Date.now() > session.expiresAt) {
+      authSessions.delete(rawHeader);
+      return null;
+    }
+    const member = state.members.find((m) => m.id === session.memberId);
+    if (!member) {
+      authSessions.delete(rawHeader);
+      return null;
+    }
+    return member;
+  }
+
+  function requireAuth(req: express.Request, res: express.Response): StoredMember | null {
+    const member = getWorkspaceAuthMember(req);
+    if (!member) {
+      res.status(401).json({ error: 'กรุณาเข้าสู่ระบบด้วยอีเมลก่อนใช้งาน' });
+      return null;
+    }
+    return member;
+  }
+
   function recordActivity(actorName: string, action: string, targetTitle: string, spaceId: string): ActivityLog {
     const activity: ActivityLog = {
       id: `act-${crypto.randomUUID().slice(0, 8)}`,
@@ -180,38 +311,73 @@ async function startServer() {
     return activity;
   }
 
+  function pushNotification(params: {
+    recipientId: string;
+    actor: StoredMember;
+    type: 'task_assigned' | 'comment_mention';
+    task: TaskItem;
+    message: string;
+  }) {
+    if (!params.recipientId || params.recipientId === params.actor.id) return;
+    const recipientExists = state.members.some((m) => m.id === params.recipientId);
+    if (!recipientExists) return;
+
+    const notification: AppNotification = {
+      id: `ntf-${crypto.randomUUID().slice(0, 8)}`,
+      recipientId: params.recipientId,
+      actorId: params.actor.id,
+      actorName: params.actor.name,
+      type: params.type,
+      taskId: params.task.id,
+      taskCode: params.task.code,
+      taskTitle: params.task.title,
+      spaceId: params.task.spaceId,
+      message: params.message,
+      read: false,
+      createdAt: new Date().toISOString(),
+    };
+    state.notifications = [notification, ...state.notifications].slice(0, 300);
+    sendToMember(params.recipientId, { type: 'notification:created', notification });
+  }
+
+  function ownerNeedsClaim(): boolean {
+    return state.members.length === 1 && !state.members[0].passwordHash && !state.members[0].email;
+  }
+
   wss.on('connection', (ws) => {
     const clientId = crypto.randomUUID().slice(0, 8);
-    const defaultMember = state.members[0] || { id: 'm-guest', name: 'ผู้ใช้งาน' };
-    const clientInfo: ActiveClient = {
-      clientId,
-      memberId: defaultMember.id,
-      name: defaultMember.name,
-      joinedAt: new Date().toISOString(),
-    };
-    clients.set(ws, clientInfo);
-
-    const initPayload: WsServerEvent = {
-      type: 'init',
-      state,
-      activeClients: getActiveClientsList(),
-      clientId,
-    };
-    ws.send(JSON.stringify(initPayload));
-    broadcast({ type: 'presence:update', activeClients: getActiveClientsList() });
 
     ws.on('message', (raw) => {
       try {
-        const msg = JSON.parse(raw.toString()) as { type?: string; memberId?: string; name?: string };
-        if (msg.type === 'presence:identify' && typeof msg.memberId === 'string') {
-          const member = state.members.find((m) => m.id === msg.memberId);
-          const current = clients.get(ws);
-          if (current) {
-            current.memberId = member ? member.id : msg.memberId;
-            current.name = member ? member.name : (typeof msg.name === 'string' && msg.name.trim() ? msg.name.trim().slice(0, 40) : current.name);
-            clients.set(ws, current);
-            broadcast({ type: 'presence:update', activeClients: getActiveClientsList() });
+        const msg = JSON.parse(raw.toString()) as { type?: string; token?: string };
+        if (msg.type === 'auth' && typeof msg.token === 'string') {
+          const session = authSessions.get(msg.token.trim());
+          if (!session || Date.now() > session.expiresAt) {
+            ws.close(4001, 'Unauthorized');
+            return;
           }
+          const member = state.members.find((m) => m.id === session.memberId);
+          if (!member) {
+            ws.close(4001, 'Unauthorized');
+            return;
+          }
+          const clientInfo: ActiveClient = {
+            clientId,
+            memberId: member.id,
+            name: member.name,
+            joinedAt: new Date().toISOString(),
+          };
+          clients.set(ws, clientInfo);
+
+          const initPayload: WsServerEvent = {
+            type: 'init',
+            state: buildUserWorkspaceState(state, member.id),
+            notifications: state.notifications.filter((n) => n.recipientId === member.id),
+            activeClients: getActiveClientsList(),
+            clientId,
+          };
+          ws.send(JSON.stringify(initPayload));
+          broadcast({ type: 'presence:update', activeClients: getActiveClientsList() });
         }
       } catch {
         // Ignore malformed WS payloads
@@ -219,75 +385,311 @@ async function startServer() {
     });
 
     ws.on('close', () => {
-      clients.delete(ws);
-      broadcast({ type: 'presence:update', activeClients: getActiveClientsList() });
+      if (clients.delete(ws)) {
+        broadcast({ type: 'presence:update', activeClients: getActiveClientsList() });
+      }
     });
   });
 
-  // Helper to read Bearer session token for GitHub proxy routes
+  // Helper to read GitHub session token for GitHub proxy routes
   function getGitHubSession(req: express.Request) {
+    const ghHeader =
+      typeof req.headers['x-github-session'] === 'string'
+        ? req.headers['x-github-session'].trim()
+        : '';
+    if (ghHeader) {
+      return githubSessions.get(ghHeader) || null;
+    }
     const auth = req.headers.authorization;
-    if (!auth || !auth.startsWith('Bearer ')) return null;
-    const token = auth.slice(7).trim();
-    return githubSessions.get(token) || null;
+    if (auth && auth.startsWith('Bearer ')) {
+      const token = auth.slice(7).trim();
+      return githubSessions.get(token) || null;
+    }
+    return null;
   }
 
-  // --- Health & Workspace API ---
+  // --- Health & Auth API ---
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, clients: clients.size });
   });
 
-  app.get('/api/workspace', (_req, res) => {
-    res.json({ state, activeClients: getActiveClientsList() });
+  app.get('/api/auth/status', (_req, res) => {
+    res.json({
+      ownerNeedsClaim: ownerNeedsClaim(),
+      memberCount: state.members.length,
+    });
   });
 
-  app.post('/api/workspace/reset', (_req, res) => {
-    const fresh = createInitialState();
-    state.spaces = fresh.spaces;
-    state.tasks = fresh.tasks;
-    state.members = fresh.members;
-    state.activities = fresh.activities;
-    const defaultMember = fresh.members[0] || { id: 'm-owner', name: 'ผู้ดูแลพื้นที่ (Owner)' };
-    for (const [socket, client] of clients) {
-      client.memberId = defaultMember.id;
-      client.name = defaultMember.name;
-      clients.set(socket, client);
-    }
-    persistWorkspaceState(state);
-    broadcast({ type: 'workspace:reset', state });
-    broadcast({ type: 'presence:update', activeClients: getActiveClientsList() });
-    res.json({ reset: true, state });
-  });
-
-  // --- Team Members ---
-  app.post('/api/members', (req, res) => {
-    const { name, role } = req.body as { name?: string; role?: string };
-    if (!name || typeof name !== 'string' || !name.trim()) {
-      res.status(400).json({ error: 'กรุณาระบุชื่อสมาชิก' });
+  app.post('/api/auth/claim-owner', (req, res) => {
+    if (!ownerNeedsClaim()) {
+      res.status(409).json({ error: 'บัญชีผู้ดูแลพื้นที่ถูกตั้งค่าไว้แล้ว กรุณาเข้าสู่ระบบด้วยอีเมล' });
       return;
     }
-    const trimmedName = name.trim().slice(0, 60);
-    const words = trimmedName.split(/\s+/).filter(Boolean);
-    const initials =
-      words.length >= 2
-        ? `${words[0][0]}${words[1][0]}`.toUpperCase()
-        : trimmedName.slice(0, 2).toUpperCase();
+    const { name, email, password, role } = req.body as {
+      name?: string;
+      email?: string;
+      password?: string;
+      role?: string;
+    };
+    const cleanEmail = typeof email === 'string' ? normalizeEmail(email) : '';
+    if (!isValidEmail(cleanEmail)) {
+      res.status(400).json({ error: 'กรุณาระบุอีเมลที่ถูกต้อง' });
+      return;
+    }
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      res.status(400).json({ error: 'กรุณาระบุชื่อผู้ใช้งาน' });
+      return;
+    }
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      res.status(400).json({ error: 'รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร' });
+      return;
+    }
 
-    const newMember = {
+    const owner = state.members[0];
+    owner.name = name.trim().slice(0, 60);
+    owner.email = cleanEmail;
+    owner.role = typeof role === 'string' && role.trim() ? role.trim().slice(0, 60) : 'Project Owner';
+    owner.initials = computeInitials(owner.name);
+    owner.passwordHash = hashPassword(password);
+    owner.status = 'active';
+
+    persistWorkspaceState(state);
+    const sessionToken = createAuthSession(owner.id);
+    res.status(201).json({ sessionToken, member: sanitizeMember(owner) });
+  });
+
+  app.post('/api/auth/register', (req, res) => {
+    const { name, email, password, role } = req.body as {
+      name?: string;
+      email?: string;
+      password?: string;
+      role?: string;
+    };
+
+    const cleanEmail = typeof email === 'string' ? normalizeEmail(email) : '';
+    if (!isValidEmail(cleanEmail)) {
+      res.status(400).json({ error: 'กรุณาระบุอีเมลที่ถูกต้อง' });
+      return;
+    }
+    if (!password || typeof password !== 'string' || password.length < 6) {
+      res.status(400).json({ error: 'รหัสผ่านต้องมีอย่างน้อย 6 ตัวอักษร' });
+      return;
+    }
+
+    const existing = state.members.find((m) => m.email === cleanEmail);
+    if (existing) {
+      if (existing.passwordHash) {
+        res.status(409).json({ error: 'อีเมลนี้ลงทะเบียนไว้แล้ว กรุณาเข้าสู่ระบบด้วยอีเมล' });
+        return;
+      }
+      // Activate invited member while preserving their member ID, tasks, and pending notifications
+      if (typeof name === 'string' && name.trim()) {
+        existing.name = name.trim().slice(0, 60);
+        existing.initials = computeInitials(existing.name);
+      }
+      if (typeof role === 'string' && role.trim()) {
+        existing.role = role.trim().slice(0, 60);
+      }
+      existing.passwordHash = hashPassword(password);
+      existing.status = 'active';
+
+      persistWorkspaceState(state);
+      const safeMember = sanitizeMember(existing);
+      broadcast({ type: 'member:updated', member: safeMember });
+      const sessionToken = createAuthSession(existing.id);
+      res.status(201).json({ sessionToken, member: safeMember });
+      return;
+    }
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      res.status(400).json({ error: 'กรุณาระบุชื่อของคุณ' });
+      return;
+    }
+
+    const trimmedName = name.trim().slice(0, 60);
+    const newMember: StoredMember = {
       id: `m-${crypto.randomUUID().slice(0, 8)}`,
       name: trimmedName,
+      email: cleanEmail,
       role: typeof role === 'string' && role.trim() ? role.trim().slice(0, 60) : 'Team Member',
       avatarUrl: '',
-      initials,
+      initials: computeInitials(trimmedName),
+      passwordHash: hashPassword(password),
+      status: 'active',
     };
 
     state.members.push(newMember);
     persistWorkspaceState(state);
-    broadcast({ type: 'member:created', member: newMember });
-    res.status(201).json({ member: newMember });
+    const safeMember = sanitizeMember(newMember);
+    broadcast({ type: 'member:created', member: safeMember });
+    const sessionToken = createAuthSession(newMember.id);
+    res.status(201).json({ sessionToken, member: safeMember });
+  });
+
+  app.post('/api/auth/login', (req, res) => {
+    const { email, password } = req.body as { email?: string; password?: string };
+    const cleanEmail = typeof email === 'string' ? normalizeEmail(email) : '';
+    if (!isValidEmail(cleanEmail) || !password || typeof password !== 'string') {
+      res.status(400).json({ error: 'กรุณาระบุอีเมลและรหัสผ่าน' });
+      return;
+    }
+
+    const member = state.members.find((m) => m.email === cleanEmail);
+    if (!member) {
+      res.status(401).json({ error: 'ไม่พบบัญชีอีเมลนี้ในระบบ กรุณาลงทะเบียนใหม่' });
+      return;
+    }
+    if (!member.passwordHash) {
+      res.status(403).json({
+        code: 'NEEDS_PASSWORD_SETUP',
+        memberName: member.name,
+        memberRole: member.role,
+        error: 'อีเมลนี้ถูกเพิ่มเข้าทีมไว้แล้ว กรุณาตั้งรหัสผ่านสำหรับเข้าใช้งานครั้งแรก',
+      });
+      return;
+    }
+    if (!verifyPassword(password, member.passwordHash)) {
+      res.status(401).json({ error: 'อีเมลหรือรหัสผ่านไม่ถูกต้อง' });
+      return;
+    }
+
+    const sessionToken = createAuthSession(member.id);
+    res.json({ sessionToken, member: sanitizeMember(member) });
+  });
+
+  app.get('/api/auth/me', (req, res) => {
+    const member = requireAuth(req, res);
+    if (!member) return;
+    res.json({ member: sanitizeMember(member) });
+  });
+
+  app.post('/api/auth/logout', (req, res) => {
+    const auth = req.headers.authorization;
+    if (auth && auth.startsWith('Bearer ')) {
+      authSessions.delete(auth.slice(7).trim());
+    }
+    res.json({ ok: true });
+  });
+
+  // --- Workspace API ---
+  app.get('/api/workspace', (req, res) => {
+    const member = requireAuth(req, res);
+    if (!member) return;
+    const userState = buildUserWorkspaceState(state, member.id);
+    res.json({
+      state: userState,
+      notifications: userState.notifications || [],
+      activeClients: getActiveClientsList(),
+    });
+  });
+
+  app.post('/api/workspace/reset', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
+    const fresh = createInitialState();
+    state.spaces = fresh.spaces;
+    state.tasks = fresh.tasks;
+    state.activities = [];
+    state.notifications = [];
+    // Keep the currently authenticated user as Owner so their session stays intact
+    authMember.role = authMember.role || 'Project Owner';
+    state.members = [authMember];
+
+    for (const [socket, client] of clients) {
+      if (client.memberId !== authMember.id) {
+        socket.close(4001, 'Workspace reset');
+      }
+    }
+
+    persistWorkspaceState(state);
+    const resetView = buildUserWorkspaceState(state, authMember.id);
+    broadcast({ type: 'workspace:reset', state: resetView });
+    broadcast({ type: 'presence:update', activeClients: getActiveClientsList() });
+    res.json({ reset: true, state: resetView });
+  });
+
+  // --- Notifications ---
+  app.patch('/api/notifications/:id/read', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
+    const notification = state.notifications.find(
+      (n) => n.id === req.params.id && n.recipientId === authMember.id
+    );
+    if (!notification) {
+      res.status(404).json({ error: 'ไม่พบการแจ้งเตือน' });
+      return;
+    }
+    notification.read = true;
+    persistWorkspaceState(state);
+    sendToMember(authMember.id, {
+      type: 'notification:updated',
+      notificationId: notification.id,
+      read: true,
+    });
+    res.json({ notification });
+  });
+
+  app.post('/api/notifications/read-all', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
+    let changed = false;
+    for (const n of state.notifications) {
+      if (n.recipientId === authMember.id && !n.read) {
+        n.read = true;
+        changed = true;
+      }
+    }
+    if (changed) {
+      persistWorkspaceState(state);
+      sendToMember(authMember.id, { type: 'notifications:read_all' });
+    }
+    res.json({ ok: true });
+  });
+
+  // --- Team Members ---
+  app.post('/api/members', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
+    const { name, email, role } = req.body as { name?: string; email?: string; role?: string };
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      res.status(400).json({ error: 'กรุณาระบุชื่อสมาชิก' });
+      return;
+    }
+    const cleanEmail = typeof email === 'string' ? normalizeEmail(email) : '';
+    if (!isValidEmail(cleanEmail)) {
+      res.status(400).json({ error: 'กรุณาระบุอีเมลของสมาชิกให้ถูกต้อง (เพื่อให้เข้าสู่ระบบและรับแจ้งเตือนได้)' });
+      return;
+    }
+    if (state.members.some((m) => m.email === cleanEmail)) {
+      res.status(409).json({ error: 'อีเมลนี้อยู่ในทีมเรียบร้อยแล้ว' });
+      return;
+    }
+
+    const trimmedName = name.trim().slice(0, 60);
+    const newMember: StoredMember = {
+      id: `m-${crypto.randomUUID().slice(0, 8)}`,
+      name: trimmedName,
+      email: cleanEmail,
+      role: typeof role === 'string' && role.trim() ? role.trim().slice(0, 60) : 'Team Member',
+      avatarUrl: '',
+      initials: computeInitials(trimmedName),
+      status: 'invited',
+    };
+
+    state.members.push(newMember);
+    persistWorkspaceState(state);
+    const safeMember = sanitizeMember(newMember);
+    broadcast({ type: 'member:created', member: safeMember });
+    res.status(201).json({ member: safeMember });
   });
 
   app.delete('/api/members/:id', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
+    if (req.params.id === authMember.id) {
+      res.status(400).json({ error: 'ไม่สามารถลบบัญชีที่คุณกำลังใช้งานอยู่ได้' });
+      return;
+    }
     if (state.members.length <= 1) {
       res.status(400).json({ error: 'ต้องมีสมาชิกอย่างน้อย 1 คนในพื้นที่ทำงาน' });
       return;
@@ -306,6 +708,10 @@ async function startServer() {
         task.assigneeId = '';
       }
     }
+    state.notifications = state.notifications.filter((n) => n.recipientId !== removed.id);
+    for (const [token, session] of authSessions) {
+      if (session.memberId === removed.id) authSessions.delete(token);
+    }
     persistWorkspaceState(state);
     broadcast({ type: 'member:deleted', memberId: removed.id });
     res.json({ deleted: true });
@@ -313,13 +719,14 @@ async function startServer() {
 
   // --- Spaces CRUD ---
   app.post('/api/spaces', (req, res) => {
-    const { name, key, description, color, githubRepo, actorName } = req.body as {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
+    const { name, key, description, color, githubRepo } = req.body as {
       name?: string;
       key?: string;
       description?: string;
       color?: string;
       githubRepo?: string;
-      actorName?: string;
     };
 
     if (!name || typeof name !== 'string' || !name.trim()) {
@@ -349,7 +756,7 @@ async function startServer() {
 
     state.spaces.push(newSpace);
     const activity = recordActivity(
-      typeof actorName === 'string' && actorName.trim() ? actorName.trim() : 'สมาชิกทีม',
+      authMember.name,
       'สร้างโปรเจกต์ใหม่',
       newSpace.name,
       newSpace.id
@@ -360,6 +767,8 @@ async function startServer() {
   });
 
   app.patch('/api/spaces/:id', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const space = state.spaces.find((s) => s.id === req.params.id);
     if (!space) {
       res.status(404).json({ error: 'ไม่พบโปรเจกต์' });
@@ -382,6 +791,8 @@ async function startServer() {
   });
 
   app.delete('/api/spaces/:id', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     if (state.spaces.length <= 1) {
       res.status(400).json({ error: 'ต้องมีอย่างน้อย 1 โปรเจกต์ในพื้นที่ทำงาน' });
       return;
@@ -393,6 +804,7 @@ async function startServer() {
     }
     const [removed] = state.spaces.splice(idx, 1);
     state.tasks = state.tasks.filter((t) => t.spaceId !== removed.id);
+    state.notifications = state.notifications.filter((n) => n.spaceId !== removed.id);
     persistWorkspaceState(state);
     broadcast({ type: 'space:deleted', spaceId: removed.id });
     res.json({ deleted: true });
@@ -400,6 +812,8 @@ async function startServer() {
 
   // --- Tasks CRUD ---
   app.post('/api/tasks', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const body = req.body as {
       spaceId?: string;
       title?: string;
@@ -414,7 +828,6 @@ async function startServer() {
       githubIssueNumber?: number;
       githubIssueUrl?: string;
       githubRepo?: string;
-      actorName?: string;
     };
 
     if (!body.title || typeof body.title !== 'string' || !body.title.trim()) {
@@ -455,9 +868,7 @@ async function startServer() {
         )
       : typeof body.assigneeId === 'string' && state.members.some((m) => m.id === body.assigneeId)
         ? [body.assigneeId]
-        : state.members[0]?.id
-          ? [state.members[0].id]
-          : [];
+        : [authMember.id];
 
     const now = new Date().toISOString();
     const newTask: TaskItem = {
@@ -498,25 +909,42 @@ async function startServer() {
 
     state.tasks.push(newTask);
     const activity = recordActivity(
-      typeof body.actorName === 'string' && body.actorName.trim() ? body.actorName.trim() : 'สมาชิกทีม',
+      authMember.name,
       'สร้างงานใหม่',
       newTask.title,
       newTask.spaceId
     );
+    for (const recipientId of validAssignees) {
+      pushNotification({
+        recipientId,
+        actor: authMember,
+        type: 'task_assigned',
+        task: newTask,
+        message: `แท็กคุณเป็นผู้รับผิดชอบในงาน ${newTask.code}`,
+      });
+    }
     persistWorkspaceState(state);
     broadcast({ type: 'task:created', task: newTask, activity });
     res.status(201).json({ task: newTask });
   });
 
   app.patch('/api/tasks/:id', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const task = state.tasks.find((t) => t.id === req.params.id);
     if (!task) {
       res.status(404).json({ error: 'ไม่พบงานที่ต้องการแก้ไข' });
       return;
     }
 
-    const body = req.body as Partial<TaskItem> & { actorName?: string };
+    const body = req.body as Partial<TaskItem>;
     const prevStatus = task.status;
+    const prevAssigneeIds = Array.isArray(task.assigneeIds)
+      ? [...task.assigneeIds]
+      : task.assigneeId
+        ? [task.assigneeId]
+        : [];
+    let newlyTaggedIds: string[] = [];
 
     if (typeof body.title === 'string' && body.title.trim()) {
       task.title = body.title.trim().slice(0, 180);
@@ -539,9 +967,13 @@ async function startServer() {
           )
         )
       );
+      newlyTaggedIds = validIds.filter((id) => !prevAssigneeIds.includes(id));
       task.assigneeIds = validIds;
       task.assigneeId = validIds[0] || '';
     } else if (typeof body.assigneeId === 'string' && state.members.some((m) => m.id === body.assigneeId)) {
+      if (!prevAssigneeIds.includes(body.assigneeId)) {
+        newlyTaggedIds = [body.assigneeId];
+      }
       task.assigneeId = body.assigneeId;
       task.assigneeIds = [body.assigneeId];
     }
@@ -584,32 +1016,44 @@ async function startServer() {
       review: 'รอตรวจสอบ',
       done: 'เสร็จสิ้น',
     };
+    const taggedNames = newlyTaggedIds
+      .map((id) => state.members.find((m) => m.id === id)?.name)
+      .filter(Boolean);
     const actionText =
       prevStatus !== task.status
         ? `เปลี่ยนสถานะเป็น "${statusLabelMap[task.status]}"`
-        : 'อัปเดตรายละเอียดงาน';
+        : taggedNames.length > 0
+          ? `แท็ก ${taggedNames.join(', ')} ในงาน`
+          : 'อัปเดตรายละเอียดงาน';
 
-    const activity = recordActivity(
-      typeof body.actorName === 'string' && body.actorName.trim() ? body.actorName.trim() : 'สมาชิกทีม',
-      actionText,
-      task.title,
-      task.spaceId
-    );
+    const activity = recordActivity(authMember.name, actionText, task.title, task.spaceId);
+
+    for (const recipientId of newlyTaggedIds) {
+      pushNotification({
+        recipientId,
+        actor: authMember,
+        type: 'task_assigned',
+        task,
+        message: `แท็กคุณเป็นผู้รับผิดชอบในงาน ${task.code}`,
+      });
+    }
+
     persistWorkspaceState(state);
     broadcast({ type: 'task:updated', task, activity });
     res.json({ task });
   });
 
   app.post('/api/tasks/:id/move', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const task = state.tasks.find((t) => t.id === req.params.id);
     if (!task) {
       res.status(404).json({ error: 'ไม่พบงาน' });
       return;
     }
-    const { status, targetIndex, actorName } = req.body as {
+    const { status, targetIndex } = req.body as {
       status?: TaskStatus;
       targetIndex?: number;
-      actorName?: string;
     };
 
     if (!VALID_STATUSES.includes(status as TaskStatus)) {
@@ -658,7 +1102,7 @@ async function startServer() {
     const activity =
       prevStatus !== nextStatus
         ? recordActivity(
-            typeof actorName === 'string' && actorName.trim() ? actorName.trim() : 'สมาชิกทีม',
+            authMember.name,
             `ย้ายงานไปที่ "${statusLabelMap[nextStatus]}"`,
             task.title,
             task.spaceId
@@ -671,31 +1115,31 @@ async function startServer() {
   });
 
   app.delete('/api/tasks/:id', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const idx = state.tasks.findIndex((t) => t.id === req.params.id);
     if (idx === -1) {
       res.status(404).json({ error: 'ไม่พบงาน' });
       return;
     }
     const [removed] = state.tasks.splice(idx, 1);
-    const actorName =
-      typeof req.query.actorName === 'string' && req.query.actorName.trim()
-        ? req.query.actorName.trim()
-        : 'สมาชิกทีม';
-    const activity = recordActivity(actorName, 'ลบงาน', removed.title, removed.spaceId);
+    state.notifications = state.notifications.filter((n) => n.taskId !== removed.id);
+    const activity = recordActivity(authMember.name, 'ลบงาน', removed.title, removed.spaceId);
     persistWorkspaceState(state);
     broadcast({ type: 'task:deleted', taskId: removed.id, activity });
     res.json({ deleted: true });
   });
 
   app.post('/api/tasks/:id/comments', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const task = state.tasks.find((t) => t.id === req.params.id);
     if (!task) {
       res.status(404).json({ error: 'ไม่พบงาน' });
       return;
     }
-    const { text, authorId, mentions } = req.body as {
+    const { text, mentions } = req.body as {
       text?: string;
-      authorId?: string;
       mentions?: string[];
     };
     if (!text || typeof text !== 'string' || !text.trim()) {
@@ -703,7 +1147,6 @@ async function startServer() {
       return;
     }
 
-    const member = state.members.find((m) => m.id === authorId) || state.members[0];
     const validMentions = Array.isArray(mentions)
       ? Array.from(
           new Set(
@@ -717,9 +1160,9 @@ async function startServer() {
 
     const comment: TaskComment = {
       id: `cm-${crypto.randomUUID().slice(0, 8)}`,
-      authorId: member.id,
-      authorName: member.name,
-      authorAvatar: member.avatarUrl,
+      authorId: authMember.id,
+      authorName: authMember.name,
+      authorAvatar: authMember.avatarUrl,
       text: text.trim().slice(0, 1000),
       mentions: validMentions.length > 0 ? validMentions : undefined,
       createdAt: new Date().toISOString(),
@@ -735,7 +1178,18 @@ async function startServer() {
         ? `แท็ก ${mentionedNames.join(', ')} ในงาน`
         : 'แสดงความคิดเห็นในงาน';
 
-    const activity = recordActivity(member.name, actionLabel, task.title, task.spaceId);
+    const activity = recordActivity(authMember.name, actionLabel, task.title, task.spaceId);
+
+    for (const recipientId of validMentions) {
+      pushNotification({
+        recipientId,
+        actor: authMember,
+        type: 'comment_mention',
+        task,
+        message: `@แท็กคุณในความคิดเห็นของงาน ${task.code}`,
+      });
+    }
+
     persistWorkspaceState(state);
     broadcast({ type: 'task:comment_added', taskId: task.id, comment, activity });
     res.status(201).json({ comment });
@@ -753,6 +1207,8 @@ async function startServer() {
   });
 
   app.get('/api/auth/github/url', (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const clientId = process.env.GITHUB_CLIENT_ID?.trim();
     const clientSecret = process.env.GITHUB_CLIENT_SECRET?.trim();
     if (!clientId || !clientSecret) {
@@ -875,6 +1331,8 @@ async function startServer() {
 
   // Connect using a Personal Access Token (stored strictly in server memory session)
   app.post('/api/github/token', async (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const { token } = req.body as { token?: string };
     if (!token || typeof token !== 'string' || !token.trim()) {
       res.status(400).json({ error: 'กรุณาระบุ GitHub Personal Access Token' });
@@ -913,9 +1371,17 @@ async function startServer() {
   });
 
   app.post('/api/github/disconnect', (req, res) => {
-    const auth = req.headers.authorization;
-    if (auth && auth.startsWith('Bearer ')) {
-      githubSessions.delete(auth.slice(7).trim());
+    const ghHeader =
+      typeof req.headers['x-github-session'] === 'string'
+        ? req.headers['x-github-session'].trim()
+        : '';
+    if (ghHeader) {
+      githubSessions.delete(ghHeader);
+    } else {
+      const auth = req.headers.authorization;
+      if (auth && auth.startsWith('Bearer ')) {
+        githubSessions.delete(auth.slice(7).trim());
+      }
     }
     res.json({ disconnected: true });
   });
@@ -960,6 +1426,8 @@ async function startServer() {
 
   // Public or authenticated repo inspection (issues + PRs)
   app.get('/api/github/repo', async (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const rawRepo = typeof req.query.repo === 'string' ? req.query.repo.trim() : '';
     const cleaned = rawRepo
       .replace(/^https?:\/\/(www\.)?github\.com\//i, '')
@@ -1027,7 +1495,9 @@ async function startServer() {
 
   // Import selected GitHub issues into a Project Space as Kanban tasks
   app.post('/api/github/import', (req, res) => {
-    const { spaceId, repo, issues, actorName } = req.body as {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
+    const { spaceId, repo, issues } = req.body as {
       spaceId?: string;
       repo?: string;
       issues?: Array<{
@@ -1037,7 +1507,6 @@ async function startServer() {
         html_url: string;
         labels?: Array<{ name: string }>;
       }>;
-      actorName?: string;
     };
 
     if (!repo || !isValidRepoSlug(repo)) {
@@ -1094,8 +1563,8 @@ async function startServer() {
         description: typeof issue.body === 'string' ? issue.body.trim().slice(0, 4000) : '',
         status: 'todo',
         priority,
-        assigneeId: state.members[0]?.id || '',
-        assigneeIds: state.members[0]?.id ? [state.members[0].id] : [],
+        assigneeId: authMember.id,
+        assigneeIds: [authMember.id],
         dueDate: new Date(Date.now() + 5 * 86_400_000).toISOString().slice(0, 10),
         order: todoMaxOrder,
         tags: ['GitHub', ...labelNames].slice(0, 5),
@@ -1113,7 +1582,7 @@ async function startServer() {
 
     if (importedTasks.length > 0) {
       const activity = recordActivity(
-        typeof actorName === 'string' && actorName.trim() ? actorName.trim() : 'สมาชิกทีม',
+        authMember.name,
         `นำเข้า ${importedTasks.length} Issue จาก ${repo}`,
         importedTasks[0].title,
         space.id
@@ -1129,6 +1598,8 @@ async function startServer() {
 
   // Create a real GitHub Issue directly from a Kanban task (requires connected GitHub session)
   app.post('/api/github/create-issue', async (req, res) => {
+    const authMember = requireAuth(req, res);
+    if (!authMember) return;
     const session = getGitHubSession(req);
     if (!session) {
       res.status(401).json({ error: 'กรุณาเชื่อมต่อบัญชี GitHub ก่อนสร้าง Issue' });
@@ -1178,7 +1649,7 @@ async function startServer() {
       task.updatedAt = new Date().toISOString();
 
       const activity = recordActivity(
-        session.user.login,
+        authMember.name,
         `สร้าง GitHub Issue #${created.number}`,
         task.title,
         task.spaceId

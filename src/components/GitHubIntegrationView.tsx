@@ -30,6 +30,7 @@ interface GitHubIntegrationViewProps {
   tasks: TaskItem[];
   activeSpaceId: string | 'all';
   activeActorName: string;
+  authToken: string;
   githubSessionToken: string | null;
   githubUser: GitHubUser | null;
   onGitHubConnected: (sessionToken: string, user: GitHubUser) => void;
@@ -43,6 +44,7 @@ export function GitHubIntegrationView({
   tasks,
   activeSpaceId,
   activeActorName,
+  authToken,
   githubSessionToken,
   githubUser,
   onGitHubConnected,
@@ -127,7 +129,10 @@ export function GitHubIntegrationView({
       return;
     }
     fetch('/api/github/user', {
-      headers: { Authorization: `Bearer ${githubSessionToken}` },
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+        'X-GitHub-Session': githubSessionToken,
+      },
     })
       .then((r) => (r.ok ? r.json() : null))
       .then((data: { repos?: GitHubRepoInfo[] } | null) => {
@@ -141,7 +146,7 @@ export function GitHubIntegrationView({
       .catch(() => {
         // Ignore silent repo fetch failure
       });
-  }, [githubSessionToken]);
+  }, [githubSessionToken, authToken]);
 
   const fetchRepo = useCallback(
     async (slug: string) => {
@@ -152,9 +157,11 @@ export function GitHubIntegrationView({
       setImportNotice(null);
       setSelectedIssues([]);
       try {
-        const headers: Record<string, string> = {};
+        const headers: Record<string, string> = {
+          Authorization: `Bearer ${authToken}`,
+        };
         if (githubSessionToken) {
-          headers.Authorization = `Bearer ${githubSessionToken}`;
+          headers['X-GitHub-Session'] = githubSessionToken;
         }
         const res = await fetch(`/api/github/repo?repo=${encodeURIComponent(trimmed)}`, {
           headers,
@@ -181,7 +188,7 @@ export function GitHubIntegrationView({
         setRepoLoading(false);
       }
     },
-    [githubSessionToken]
+    [githubSessionToken, authToken]
   );
 
   useEffect(() => {
@@ -191,7 +198,9 @@ export function GitHubIntegrationView({
   const handleOAuthLogin = async () => {
     setAuthError(null);
     try {
-      const res = await fetch('/api/auth/github/url');
+      const res = await fetch('/api/auth/github/url', {
+        headers: { Authorization: `Bearer ${authToken}` },
+      });
       const data = (await res.json()) as { url?: string; error?: string };
       if (!res.ok || !data.url) {
         setAuthError(data.error || 'ไม่สามารถเปิดหน้าต่างเข้าสู่ระบบ GitHub ได้');
@@ -215,7 +224,10 @@ export function GitHubIntegrationView({
     try {
       const res = await fetch('/api/github/token', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify({ token }),
       });
       const data = (await res.json()) as {
@@ -240,7 +252,10 @@ export function GitHubIntegrationView({
     if (githubSessionToken) {
       await fetch('/api/github/disconnect', {
         method: 'POST',
-        headers: { Authorization: `Bearer ${githubSessionToken}` },
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          'X-GitHub-Session': githubSessionToken,
+        },
       }).catch(() => undefined);
     }
     onGitHubDisconnected();
@@ -260,7 +275,10 @@ export function GitHubIntegrationView({
       const chosen = issues.filter((i) => selectedIssues.includes(i.number));
       const res = await fetch('/api/github/import', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${authToken}`,
+        },
         body: JSON.stringify({
           spaceId: targetSpaceId || spaces[0]?.id,
           repo: repoInfo.full_name,
